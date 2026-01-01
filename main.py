@@ -8,7 +8,7 @@ from datetime import datetime
 from fastmcp import FastMCP
 
 # ────────────────────────────────────────────────
-# CONFIG
+# CONFIGURATION
 # ────────────────────────────────────────────────
 
 BASE_DIR = os.path.dirname(__file__)
@@ -18,18 +18,19 @@ CATEGORIES_PATH = os.path.join(BASE_DIR, "categories.json")
 mcp = FastMCP(name="Expense Tracker")
 
 # ────────────────────────────────────────────────
-# SYNCHRONOUS DB INITIALIZATION (safe at import time)
+# SYNCHRONOUS DATABASE INITIALIZATION
+# (The safest way with current fastmcp versions)
 # ────────────────────────────────────────────────
 
 def init_db_sync():
-    """Create table if it doesn't exist - runs once when module is imported"""
+    """Create the expenses table if it doesn't exist"""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS expenses (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            date        TEXT NOT NULL,               -- ISO format: YYYY-MM-DD
-            created_at  TEXT DEFAULT (datetime('now')),
-            updated_at  TEXT DEFAULT (datetime('now')),
+            date        TEXT NOT NULL,               -- format: YYYY-MM-DD
+            created_at  TEXT DEFAULT (datetime('now','localtime')),
+            updated_at  TEXT DEFAULT (datetime('now','localtime')),
             amount      REAL  NOT NULL CHECK(amount >= 0),
             currency    TEXT  DEFAULT 'USD' CHECK(length(currency) = 3),
             category    TEXT  NOT NULL,
@@ -39,12 +40,10 @@ def init_db_sync():
             notes       TEXT
         );
         """)
-        conn.commit()
-        # Optional: create index for faster queries
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_date ON expenses(date);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);")
         conn.commit()
 
-# Run initialization right away (before any async context)
+# Execute initialization once when module is loaded
 init_db_sync()
 
 # ────────────────────────────────────────────────
@@ -53,7 +52,7 @@ init_db_sync()
 
 @mcp.tool()
 async def add_expense(
-    date: str,                    # expected format: YYYY-MM-DD
+    date: str,
     amount: float,
     category: str,
     subcategory: Optional[str] = None,
@@ -62,24 +61,23 @@ async def add_expense(
     notes: Optional[str] = None,
     currency: str = "USD"
 ) -> Dict[str, Any]:
-    """Add a new expense entry"""
+    """Add new expense entry. Date must be in YYYY-MM-DD format."""
     try:
-        # Basic validation
-        datetime.strptime(date, "%Y-%m-%d")  # will raise ValueError if invalid
+        # Minimal validation
+        datetime.strptime(date, "%Y-%m-%d")
         if amount < 0:
             raise ValueError("Amount cannot be negative")
         if len(currency) != 3:
-            raise ValueError("Currency must be 3-letter code")
+            raise ValueError("Currency must be 3-letter ISO code")
 
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
+            async with db.execute("""
                 INSERT INTO expenses 
                 (date, amount, currency, category, subcategory, payment_method, merchant, notes)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (date, amount, currency, category, subcategory, payment_method, merchant, notes))
-            
-            await db.commit()
-            new_id = db.lastrowid
+            """, (date, amount, currency.upper(), category, subcategory, payment_method, merchant, notes)) as cursor:
+                await db.commit()
+                new_id = cursor.lastrowid
 
         return {
             "success": True,
@@ -88,24 +86,24 @@ async def add_expense(
         }
 
     except ValueError as e:
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": f"Validation error: {str(e)}"}
     except Exception as e:
         return {"success": False, "error": f"Database error: {str(e)}"}
 
 
 @mcp.tool()
 async def list_expenses(
-    start_date: Optional[str] = None,   # YYYY-MM-DD
-    end_date: Optional[str] = None,     # YYYY-MM-DD
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     limit: int = 100
 ) -> Dict[str, Any]:
-    """List recent expenses with optional date range filter"""
+    """List expenses with optional date range filter"""
     query = """
         SELECT id, date, amount, currency, category, subcategory,
                payment_method, merchant, notes, created_at
         FROM expenses
     """
-    params: List[Any] = []
+    params = []
 
     conditions = []
     if start_date:
@@ -119,7 +117,7 @@ async def list_expenses(
         query += " WHERE " + " AND ".join(conditions)
 
     query += " ORDER BY date DESC, id DESC LIMIT ?"
-    params.append(min(limit, 500))  # safety limit
+    params.append(min(limit, 1000))  # reasonable upper limit
 
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -147,39 +145,23 @@ async def update_expense(
     notes: Optional[str] = None,
     currency: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Update existing expense"""
-    if not any([date, amount is not None, category, subcategory, payment_method, merchant, notes, currency]):
-        return {"success": False, "message": "No fields to update"}
+    """Update an existing expense"""
+    if all(v is None for v in [date, amount, category, subcategory, payment_method, merchant, notes, currency]):
+        return {"success": False, "message": "No fields to update provided"}
 
     fields = []
-    values: List[Any] = []
+    values = []
 
-    if date is not None:
-        fields.append("date = ?")
-        values.append(date)
-    if amount is not None:
-        fields.append("amount = ?")
-        values.append(amount)
-    if category is not None:
-        fields.append("category = ?")
-        values.append(category)
-    if subcategory is not None:
-        fields.append("subcategory = ?")
-        values.append(subcategory)
-    if payment_method is not None:
-        fields.append("payment_method = ?")
-        values.append(payment_method)
-    if merchant is not None:
-        fields.append("merchant = ?")
-        values.append(merchant)
-    if notes is not None:
-        fields.append("notes = ?")
-        values.append(notes)
-    if currency is not None:
-        fields.append("currency = ?")
-        values.append(currency)
+    if date is not None:        fields.append("date = ?");        values.append(date)
+    if amount is not None:      fields.append("amount = ?");      values.append(amount)
+    if category is not None:    fields.append("category = ?");    values.append(category)
+    if subcategory is not None: fields.append("subcategory = ?"); values.append(subcategory)
+    if payment_method is not None: fields.append("payment_method = ?"); values.append(payment_method)
+    if merchant is not None:    fields.append("merchant = ?");    values.append(merchant)
+    if notes is not None:       fields.append("notes = ?");       values.append(notes)
+    if currency is not None:    fields.append("currency = ?");    values.append(currency.upper())
 
-    fields.append("updated_at = datetime('now')")
+    fields.append("updated_at = datetime('now','localtime')")
     query = f"UPDATE expenses SET {', '.join(fields)} WHERE id = ?"
     values.append(id)
 
@@ -196,7 +178,7 @@ async def update_expense(
 
 @mcp.tool()
 async def delete_expense(id: int) -> Dict[str, Any]:
-    """Delete an expense by ID"""
+    """Delete expense by ID"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("DELETE FROM expenses WHERE id = ?", (id,))
@@ -210,32 +192,32 @@ async def delete_expense(id: int) -> Dict[str, Any]:
 
 @mcp.tool()
 async def get_expense_summary() -> Dict[str, Any]:
-    """Get total expenses and breakdown by category/subcategory"""
+    """Get total amount and breakdown by category/subcategory"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
 
-            # Total
-            async with db.execute("SELECT SUM(amount) AS total FROM expenses") as c:
-                total = (await c.fetchone())["total"] or 0.0
+            async with db.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM expenses") as c:
+                total = (await c.fetchone())["total"]
 
-            # By category/subcategory
             async with db.execute("""
-                SELECT category, subcategory, SUM(amount) AS total
+                SELECT category, subcategory, COALESCE(SUM(amount), 0) AS total
                 FROM expenses
                 GROUP BY category, subcategory
+                HAVING total > 0
                 ORDER BY total DESC
             """) as c:
                 rows = await c.fetchall()
 
         return {
             "success": True,
-            "total": round(total, 2),
+            "total": round(float(total), 2),
+            "currency": "USD",  # can be made dynamic later
             "by_category": [
                 {
                     "category": r["category"],
                     "subcategory": r["subcategory"] or None,
-                    "total": round(r["total"], 2)
+                    "total": round(float(r["total"]), 2)
                 }
                 for r in rows
             ]
@@ -245,42 +227,31 @@ async def get_expense_summary() -> Dict[str, Any]:
 
 
 # ────────────────────────────────────────────────
-# RESOURCE
+# RESOURCE - Categories
 # ────────────────────────────────────────────────
 
 @mcp.resource("expenses://categories", mime_type="application/json")
-async def get_categories():
-    """Returns list of available categories"""
+async def categories():
     try:
-        # Using asyncio.to_thread to not block event loop
-        content = await asyncio.to_thread(
-            lambda: open(CATEGORIES_PATH, "r", encoding="utf-8").read()
-        )
-        return content
+        async with asyncio.to_thread(open, CATEGORIES_PATH, "r", encoding="utf-8") as f:
+            return f.read()
     except Exception:
-        return json.dumps({"error": "Categories file not found"})
+        return json.dumps({"error": "categories.json file not found"}, indent=2)
 
 
 # ────────────────────────────────────────────────
-# START SERVER
+# SERVER START
 # ────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Starting Expense Tracker server...")
-    print(f"Database: {DB_PATH}")
+    print("Expense Tracker server starting...")
+    print(f"Database location: {DB_PATH}")
+    print(f"Categories file:    {CATEGORIES_PATH}")
     mcp.run(
         transport="http",
         host="0.0.0.0",
         port=8000,
-        # You can add workers=4 etc. when your version supports it
     )
-
-
-
-
-
-
-
 
 
 
